@@ -1,0 +1,12 @@
+﻿# 核心依赖
+pandas>=1.5.0
+numpy>=1.24.0
+scikit-learn>=1.2.0
+
+# A股数据（选装，离线模式会自动用模拟数据）
+akshare>=1.12.0
+baostock>=0.8.8
+
+# 可视化（可选）
+matplotlib>=3.6.0
+seaborn>=0.12.0
