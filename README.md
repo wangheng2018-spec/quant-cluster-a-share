@@ -77,6 +77,9 @@ pip install -r requirements.txt
 
 ## 快速使用
 
+> 📖 **完整实操指南请见 [GUIDE.md](./GUIDE.md)**
+> 包含：证券开户 → 环境搭建 → QMT/PTrade 实盘对接 → 免坑指南 → 检查清单
+
 ```bash
 # 默认运行（KMeans + 自动 K 寻优 + 单聚类）
 python main.py
