@@ -1,10 +1,11 @@
 """
 仓位管理与风险控制
-核心：根据聚类评分、市场状态动态分配资金 + 止损止盈
+核心：条件触发再平衡 + 市场波动自适应仓位 + 多聚类组合资金分配
 """
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Tuple, Optional
+from datetime import datetime, timedelta
 
 from config import Config
 
@@ -14,14 +15,48 @@ class PortfolioManager:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.positions: Dict[str, dict] = {}   # code -> 持仓信息
+        self.positions: Dict[str, dict] = {}
         self.cash: float = cfg.initial_capital
         self.total_value: float = cfg.initial_capital
-        self.trades: List[dict] = []            # 交易记录
-        self.equity_curve: List[dict] = []      # 净值曲线
+        self.trades: List[dict] = []
+        self.equity_curve: List[dict] = []
+        self.last_rebalance_date = None
+        self.peak_value = cfg.initial_capital
 
     # ──────────────────────────────────────────
-    # 核心：仓位分配
+    # 条件再平衡检查
+    # ──────────────────────────────────────────
+    def should_rebalance(self, current_date,
+                         market_return_today: float = 0.0) -> Tuple[bool, str]:
+        """
+        检查是否满足再平衡触发条件（按优先级）
+        返回 (是否触发, 原因)
+        """
+        if self.last_rebalance_date is None:
+            return True, "首次建仓"
+
+        days_since = (current_date - self.last_rebalance_date).days
+        if days_since < self.cfg.rebalance_min_days:
+            return False, f"未到最小间隔（{days_since}/{self.cfg.rebalance_min_days}天）"
+
+        # 条件1：最大间隔天数
+        if days_since >= self.cfg.rebalance_days:
+            return True, f"最大间隔触发（{days_since}天）"
+
+        # 条件2：组合回撤
+        if self.peak_value > 0:
+            current_dd = (self.peak_value - self.total_value) / self.peak_value
+            if current_dd >= self.cfg.rebalance_max_drawdown:
+                return True, f"回撤{current_dd*100:.1f}%触发再平衡"
+
+        # 条件3：市场冲击
+        if market_return_today <= -self.cfg.rebalance_market_shock:
+            return True, f"市场单日跌幅{market_return_today*100:.1f}%触发再平衡"
+
+        return False, "无触发条件"
+
+    # ──────────────────────────────────────────
+    # 仓位分配
     # ──────────────────────────────────────────
     def calculate_positions(
         self, selected_stocks: pd.DataFrame,
@@ -30,291 +65,254 @@ class PortfolioManager:
     ) -> List[dict]:
         """
         计算目标仓位分配
-        策略: 等权重 + 动态总仓位控制
+        多聚类组合按评分加权，单聚类等权重
         """
         n = min(len(selected_stocks), self.cfg.max_positions)
         if n == 0:
             return []
 
-        # 1. 根据市场波动率调整总仓位
+        # 1. 市场波动 -> 总仓位系数
         vol_factor = self._volatility_adjust(market_volatility)
         target_position_weight = np.clip(
             self.cfg.max_position_weight * vol_factor,
             self.cfg.min_position_weight,
             self.cfg.max_position_weight,
         )
+        target_value = self.total_value * target_position_weight
 
-        # 2. 计算目标总仓位
-        target_position_value = self.total_value * target_position_weight
-
-        # 3. 等权重分配
-        if self.cfg.equal_weight:
-            per_stock = target_position_value / n
+        # 2. 分配权重
+        if self.cfg.equal_weight or "alloc_weight" not in selected_stocks.columns:
+            # 等权重
+            per_stock = target_value / n
             per_stock = min(per_stock, self.total_value * self.cfg.max_single_weight)
+            signals = []
+            for _, row in selected_stocks.head(n).iterrows():
+                w = per_stock / self.total_value
+                signals.append(self._make_buy_signal(row, per_stock, w))
         else:
-            # 按评分加权分配
-            total_score = sum(
-                cluster_scores.get(s.get("cluster", 0), {}).get("score", 1.0)
-                for _, s in selected_stocks.head(n).iterrows()
-            ) if cluster_scores else n
-            per_stock = target_position_value / total_score
-
-        # 4. 生成交易信号
-        signals = []
-        for idx, row in selected_stocks.head(n).iterrows():
-            code = row["code"]
-            weight = per_stock / self.total_value
-            signals.append({
-                "code": code,
-                "name": row["name"],
-                "target_amount": per_stock,
-                "target_weight": round(weight, 4),
-                "action": "buy",
-                "reason": (
-                    f"聚类标的中选入 | "
-                    f"PE={row.get('pe_ttm','?'):.1f} "
-                    f"PB={row.get('pb','?'):.2f} "
-                    f"股息={row.get('dividend_yield',0)*100:.2f}%"
-                ),
-            })
+            # 评分加权（多聚类）
+            total_weight = selected_stocks["alloc_weight"].sum()
+            signals = []
+            per_stock_base = target_value / total_weight
+            for _, row in selected_stocks.head(n).iterrows():
+                w = row.get("alloc_weight", 1.0 / n)
+                amount = min(per_stock_base * w,
+                             self.total_value * self.cfg.max_single_weight)
+                signals.append(self._make_buy_signal(row, amount, amount / self.total_value))
 
         return signals
 
-    def _volatility_adjust(self, market_vol: float) -> float:
-        """
-        市场波动率调整系数
-        波动高 -> 降低仓位，波动低 -> 满仓
-        """
-        if market_vol <= 0.15:
-            return 1.0                     # 低波动，满仓
-        elif market_vol <= 0.25:
-            return 0.85                    # 正常波动
-        elif market_vol <= 0.35:
-            return 0.70                    # 偏高波动
-        elif market_vol <= 0.50:
-            return 0.50                    # 高波动，半仓
-        else:
-            return 0.30                    # 极高波动，轻仓
+    def _make_buy_signal(self, row, amount, weight):
+        return {
+            "code": row["code"],
+            "name": row["name"],
+            "target_amount": amount,
+            "target_weight": round(weight, 4),
+            "action": "buy",
+            "cluster": row.get("cluster", "?"),
+            "reason": (f"聚类#{row.get('cluster','?')} 选入 | "
+                       f"PE={row.get('pe_ttm','?'):.1f} "
+                       f"PB={row.get('pb','?'):.2f}"),
+        }
 
     # ──────────────────────────────────────────
-    # 止损/止盈检查
+    # 市场波动 -> 仓位系数
+    # ──────────────────────────────────────────
+    def _volatility_adjust(self, vol: float) -> float:
+        if vol <= self.cfg.vol_low:
+            return 1.0
+        elif vol <= self.cfg.vol_normal:
+            return 0.85
+        elif vol <= self.cfg.vol_high:
+            return 0.70
+        elif vol <= self.cfg.vol_extreme:
+            return 0.50
+        else:
+            return 0.30
+
+    def get_market_state(self, vol: float) -> str:
+        if vol <= self.cfg.vol_low:
+            return "🟢 低波动·满仓"
+        elif vol <= self.cfg.vol_normal:
+            return "🟡 正常·8.5成仓"
+        elif vol <= self.cfg.vol_high:
+            return "🟠 高波动·7成仓"
+        elif vol <= self.cfg.vol_extreme:
+            return "🔴 极高波动·5成仓"
+        else:
+            return "⛔ 极端行情·3成仓"
+
+    # ──────────────────────────────────────────
+    # 止损/止盈
     # ──────────────────────────────────────────
     def check_stops(self, prices: Dict[str, float], date) -> List[dict]:
-        """
-        检查所有持仓的止损止盈
-        返回需要卖出的信号列表
-        """
         signals = []
         for code, pos in list(self.positions.items()):
-            current_price = prices.get(code)
-            if current_price is None:
+            price = prices.get(code)
+            if price is None:
                 continue
-
             cost = pos["avg_cost"]
-            change = (current_price - cost) / cost
+            change = (price - cost) / cost
 
-            # 止损
             if change <= -self.cfg.stop_loss:
                 signals.append({
-                    "code": code,
-                    "name": pos["name"],
+                    "code": code, "name": pos["name"],
                     "action": "sell",
-                    "reason": f"止损触发: {change*100:.1f}% ≤ -{self.cfg.stop_loss*100:.0f}%",
-                    "amount": pos["shares"] * current_price,
+                    "reason": f"止损: {change*100:.1f}% ≤ -{self.cfg.stop_loss*100:.0f}%",
+                    "amount": pos["shares"] * price,
                 })
-
-            # 止盈
             elif change >= self.cfg.take_profit:
-                # 分批止盈：卖出一半
-                sell_shares = pos["shares"] // 2
-                if sell_shares > 0:
+                sell_s = pos["shares"] // 2
+                if sell_s > 0:
                     signals.append({
-                        "code": code,
-                        "name": pos["name"],
+                        "code": code, "name": pos["name"],
                         "action": "sell_partial",
-                        "reason": f"止盈触发: {change*100:.1f}% ≥ {self.cfg.take_profit*100:.0f}%",
-                        "amount": sell_shares * current_price,
-                        "shares": sell_shares,
+                        "reason": f"止盈: {change*100:.1f}% ≥ {self.cfg.take_profit*100:.0f}%",
+                        "amount": sell_s * price,
+                        "shares": sell_s,
                     })
-
         return signals
 
     # ──────────────────────────────────────────
     # 执行交易
     # ──────────────────────────────────────────
     def execute_trade(self, signal: dict, price: float, date) -> dict:
-        """执行单笔交易"""
         code = signal["code"]
         action = signal["action"]
         trade = {
-            "date": date,
-            "code": code,
+            "date": date, "code": code,
             "name": signal.get("name", ""),
-            "action": action,
-            "price": round(price, 3),
+            "action": action, "price": round(price, 3),
             "reason": signal.get("reason", ""),
         }
 
-        if action in ("buy",):
-            shares = int(signal["target_amount"] / price)
+        if action == "buy":
+            amt = signal.get("target_amount", 0)
+            shares = int(amt / price) if price > 0 else 0
             cost = shares * price
-            commission = cost * self.cfg.commission
-            total_cost = cost + commission
-
-            if total_cost <= self.cash:
-                self.cash -= total_cost
-                # 更新持仓
+            comm = cost * self.cfg.commission
+            total = cost + comm
+            if total <= self.cash and shares > 0:
+                self.cash -= total
                 if code in self.positions:
-                    pos = self.positions[code]
-                    total_shares = pos["shares"] + shares
-                    total_cost_basis = pos["cost_basis"] + cost
-                    pos["shares"] = total_shares
-                    pos["cost_basis"] = total_cost_basis
-                    pos["avg_cost"] = total_cost_basis / total_shares
+                    p = self.positions[code]
+                    total_s = p["shares"] + shares
+                    total_basis = p["cost_basis"] + cost
+                    p.update(shares=total_s, cost_basis=total_basis,
+                             avg_cost=total_basis / total_s)
                 else:
                     self.positions[code] = {
-                        "shares": shares,
-                        "cost_basis": cost,
-                        "avg_cost": price,
-                        "name": signal.get("name", code),
+                        "shares": shares, "cost_basis": cost,
+                        "avg_cost": price, "name": signal.get("name", code),
                     }
-                trade.update({
-                    "shares": shares,
-                    "amount": round(total_cost, 2),
-                    "commission": round(commission, 2),
-                })
+                trade.update(shares=shares, amount=round(total, 2),
+                             commission=round(comm, 2))
             else:
-                trade["status"] = "skipped (insufficient cash)"
+                trade["status"] = "skipped"
 
         elif action in ("sell",):
             pos = self.positions.get(code)
             if pos:
-                shares = pos["shares"]
-                proceeds = shares * price
+                s = pos["shares"]
+                proceeds = s * price
                 stamp = proceeds * self.cfg.stamp_tax
-                commission = proceeds * self.cfg.commission
-                net_proceeds = proceeds - stamp - commission
-
-                self.cash += net_proceeds
+                comm = proceeds * self.cfg.commission
+                net = proceeds - stamp - comm
+                self.cash += net
                 del self.positions[code]
-                trade.update({
-                    "shares": shares,
-                    "amount": round(proceeds, 2),
-                    "commission": round(commission, 2),
-                    "stamp_tax": round(stamp, 2),
-                    "net_proceeds": round(net_proceeds, 2),
-                })
+                trade.update(shares=s, amount=round(proceeds, 2),
+                             commission=round(comm, 2),
+                             stamp_tax=round(stamp, 2), net=round(net, 2))
 
-        elif action in ("sell_partial",):
+        elif action == "sell_partial":
             pos = self.positions.get(code)
-            sell_shares = signal.get("shares", pos["shares"] // 2 if pos else 0)
-            if pos and sell_shares > 0:
-                proceeds = sell_shares * price
+            sell_s = signal.get("shares", pos["shares"] // 2 if pos else 0)
+            if pos and sell_s > 0:
+                proceeds = sell_s * price
                 stamp = proceeds * self.cfg.stamp_tax
-                commission = proceeds * self.cfg.commission
-                net_proceeds = proceeds - stamp - commission
-
-                self.cash += net_proceeds
-                pos["shares"] -= sell_shares
-                pos["cost_basis"] *= (pos["shares"]
-                                      / (pos["shares"] + sell_shares))
+                comm = proceeds * self.cfg.commission
+                net = proceeds - stamp - comm
+                self.cash += net
+                pos["shares"] -= sell_s
+                pos["cost_basis"] *= pos["shares"] / (pos["shares"] + sell_s)
                 if pos["shares"] <= 0:
                     del self.positions[code]
-                trade.update({
-                    "shares": sell_shares,
-                    "amount": round(proceeds, 2),
-                    "commission": round(commission, 2),
-                    "stamp_tax": round(stamp, 2),
-                    "net_proceeds": round(net_proceeds, 2),
-                })
+                trade.update(shares=sell_s, amount=round(proceeds, 2),
+                             commission=round(comm, 2),
+                             stamp_tax=round(stamp, 2), net=round(net, 2))
 
         self.trades.append(trade)
         return trade
 
     # ──────────────────────────────────────────
-    # 每日净值更新
+    # 每日净值
     # ──────────────────────────────────────────
     def update_nav(self, prices: Dict[str, float], date) -> dict:
-        """更新每日净值"""
-        position_value = 0.0
-        for code, pos in list(self.positions.items()):
-            price = prices.get(code)
-            if price:
-                position_value += price * pos["shares"]
+        pos_value = sum(
+            prices.get(c, 0) * p["shares"]
+            for c, p in self.positions.items()
+        )
+        self.total_value = self.cash + pos_value
+        if self.total_value > self.peak_value:
+            self.peak_value = self.total_value
 
-        self.total_value = self.cash + position_value
+        dd = (self.peak_value - self.total_value) / self.peak_value if self.peak_value > 0 else 0
         entry = {
-            "date": date,
-            "cash": round(self.cash, 2),
-            "position_value": round(position_value, 2),
+            "date": date, "cash": round(self.cash, 2),
+            "position_value": round(pos_value, 2),
             "total_value": round(self.total_value, 2),
-            "position_ratio": round(position_value / self.total_value, 4)
-            if self.total_value > 0 else 0,
+            "position_ratio": round(pos_value / self.total_value, 4) if self.total_value > 0 else 0,
+            "drawdown": round(dd * 100, 2),
             "positions": len(self.positions),
         }
         self.equity_curve.append(entry)
         return entry
 
     # ──────────────────────────────────────────
-    # 组合统计
+    # 绩效统计
     # ──────────────────────────────────────────
     def get_summary(self) -> dict:
-        """返回投资组合绩效统计"""
         if not self.equity_curve:
             return {}
 
-        initial = self.cfg.initial_capital
+        init = self.cfg.initial_capital
         final = self.equity_curve[-1]["total_value"]
-        total_return = (final - initial) / initial
-
-        # 年化收益率（按 250 交易日）
+        total_ret = (final - init) / init
         n_days = len(self.equity_curve)
-        annual_return = (1 + total_return) ** (250 / max(n_days, 1)) - 1
+        annual_ret = (1 + total_ret) ** (250 / max(n_days, 1)) - 1 if n_days > 0 else 0
 
         # 最大回撤
-        peak = initial
-        max_dd = 0
-        for e in self.equity_curve:
-            v = e["total_value"]
-            if v > peak:
-                peak = v
-            dd = (peak - v) / peak
-            if dd > max_dd:
-                max_dd = dd
+        max_dd = max(e.get("drawdown", 0) for e in self.equity_curve)
 
-        # 夏普比
-        daily_returns = []
+        # 夏普
+        daily_rets = []
         for i in range(1, len(self.equity_curve)):
             r = (self.equity_curve[i]["total_value"]
-                 - self.equity_curve[i - 1]["total_value"])
-            daily_returns.append(r)
-
+                 - self.equity_curve[i-1]["total_value"])
+            daily_rets.append(r)
         sharpe = 0
-        if len(daily_returns) > 1:
-            mean_ret = np.mean(daily_returns)
-            std_ret = np.std(daily_returns)
-            if std_ret > 0:
-                sharpe = (mean_ret / std_ret) * np.sqrt(250)
+        if len(daily_rets) > 1:
+            m = np.mean(daily_rets)
+            s = np.std(daily_rets)
+            if s > 0:
+                sharpe = round((m / s) * np.sqrt(250), 2)
 
         # 胜率
-        wins = 0
-        total_trades = len(self.trades)
-        for i in range(1, len(self.trades)):
-            if self.trades[i].get("net_proceeds", 0) > 0 \
-               and self.trades[i].get("amount", 0) > 0:
-                ratio = (self.trades[i]["net_proceeds"]
-                         - self.trades[i]["amount"]) / self.trades[i]["amount"]
-                if ratio > 0:
-                    wins += 1
+        wins = sum(1 for t in self.trades
+                   if t.get("action") in ("sell", "sell_partial")
+                   and t.get("net", 0) > t.get("amount", 0))
+        total_closed = sum(1 for t in self.trades
+                           if t.get("action") in ("sell", "sell_partial"))
 
         return {
-            "initial_capital": initial,
-            "final_value": final,
-            "total_return": round(total_return * 100, 2),
-            "annual_return": round(annual_return * 100, 2),
-            "max_drawdown": round(max_dd * 100, 2),
-            "sharpe_ratio": round(sharpe, 2),
-            "total_trades": total_trades,
+            "initial_capital": init,
+            "final_value": round(final, 2),
+            "total_return": round(total_ret * 100, 2),
+            "annual_return": round(annual_ret * 100, 2),
+            "max_drawdown": round(max_dd, 2),
+            "sharpe_ratio": sharpe,
+            "total_trades": len(self.trades),
+            "win_rate": round(wins / max(total_closed, 1) * 100, 1),
             "final_positions": len(self.positions),
             "cash_remaining": round(self.cash, 2),
         }
