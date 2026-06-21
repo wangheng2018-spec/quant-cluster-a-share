@@ -49,7 +49,7 @@
 
 ```bash
 # 1. 克隆
-git clone https://github.com/你的用户名/quant-cluster-a-share.git
+git clone https://github.com/wangheng2018-spec/quant-cluster-a-share.git
 cd quant-cluster-a-share
 
 # 2. 创建虚拟环境（推荐）
@@ -179,7 +179,7 @@ sudo apt update && sudo apt upgrade -y
 sudo apt install python3 python3-pip python3-venv -y
 
 # 3. 克隆项目
-git clone https://github.com/你的用户名/quant-cluster-a-share.git
+git clone https://github.com/wangheng2018-spec/quant-cluster-a-share.git
 cd quant-cluster-a-share
 
 # 4. 设置定时任务（每周运行一次）
